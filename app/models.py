@@ -247,3 +247,28 @@ class ScrapeProgress(Base):
             unique=True,
         ),
     )
+
+
+class StockUpdateLog(Base):
+    __tablename__ = "stock_update_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    sku = Column(String(200), nullable=False)
+    title = Column(String(1000), nullable=True)
+    old_stock = Column(Integer, nullable=True)
+    new_stock = Column(Integer, nullable=True)
+    old_status = Column(String(50), nullable=True)
+    new_status = Column(String(50), nullable=True)
+    job_id = Column(
+        Integer, ForeignKey("scrape_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime, default=utc_now)
+
+    __table_args__ = (
+        Index("idx_stock_logs_product", "product_id"),
+        Index("idx_stock_logs_sku", "sku"),
+        Index("idx_stock_logs_created", "created_at"),
+    )

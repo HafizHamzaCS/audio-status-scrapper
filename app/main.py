@@ -70,7 +70,33 @@ async def lifespan(app: FastAPI):
             f"Database migration/connection failed after 3 attempts: {last_exc}"
         ) from last_exc
 
+    # Start periodic stock-only background loop (default every 6 hours)
+    stock_sync_task = None
+    if settings.auto_stock_sync_hours > 0:
+        async def _periodic_stock_sync():
+            interval_seconds = settings.auto_stock_sync_hours * 3600
+            logger.info("Automatic stock sync task scheduled every %d hours", settings.auto_stock_sync_hours)
+            while True:
+                try:
+                    await asyncio.sleep(interval_seconds)
+                    logger.info("Starting scheduled %d-hour stock-only sync...", settings.auto_stock_sync_hours)
+                    from app.router import run_stock_only_sync_job
+                    await run_stock_only_sync_job()
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.error("Periodic stock sync task error: %s", exc)
+
+        stock_sync_task = asyncio.create_task(_periodic_stock_sync())
+
     yield
+
+    if stock_sync_task:
+        stock_sync_task.cancel()
+        try:
+            await stock_sync_task
+        except asyncio.CancelledError:
+            pass
     await engine.dispose()
 
 

@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     rate_limit: float = 0.0
     category_deactivation_threshold: int = 2
     job_stale_after: int = 120
+    auto_stock_sync_hours: int = 6
 
     @field_validator(
         "concurrency",

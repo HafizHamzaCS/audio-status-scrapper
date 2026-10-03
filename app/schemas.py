@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from app.models import Product, Category
 from app.config import settings
@@ -403,3 +403,30 @@ class SyncResponse(BaseModel):
     job_id: int
     status: str
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Stock Update Audit Log Schemas
+# ---------------------------------------------------------------------------
+
+
+class StockUpdateLogOut(BaseModel):
+    id: int
+    product_id: int
+    sku: str
+    title: Optional[str] = None
+    old_stock: Optional[int] = None
+    new_stock: Optional[int] = None
+    old_status: Optional[str] = None
+    new_status: Optional[str] = None
+    job_id: Optional[int] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class StockUpdatesResponse(BaseModel):
+    total: int
+    page: int
+    limit: int
+    updates: List[StockUpdateLogOut]

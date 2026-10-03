@@ -12,6 +12,7 @@ from app.models import (
     Attribute,
     ScrapeJob,
     ScrapeProgress,
+    StockUpdateLog,
     product_categories,
 )
 from app.timeutils import utc_now
@@ -1078,3 +1079,82 @@ async def get_scrape_progress(
         )
     )
     return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# Stock-Only Updates & Audit Logging
+# ---------------------------------------------------------------------------
+
+
+async def upsert_product_stock_only(
+    db: AsyncSession,
+    sku: str,
+    stock: Optional[int],
+    stock_status: Optional[str],
+    job_id: Optional[int] = None,
+) -> Tuple[Optional[Product], bool]:
+    """Update ONLY stock and stock_status for a product.
+
+    Does NOT modify title, description, price, categories, images, or specs.
+    Logs changes to StockUpdateLog table if stock or status altered.
+    """
+    product = await get_product_by_sku(db, sku)
+    if not product:
+        return None, False
+
+    old_stock = product.stock
+    old_status = product.stock_status
+
+    stock_changed = old_stock != stock
+    status_changed = old_status != stock_status
+
+    if stock_changed or status_changed:
+        product.stock = stock
+        if stock_status:
+            product.stock_status = stock_status
+        product.updated_at = utc_now()
+
+        log_entry = StockUpdateLog(
+            product_id=product.id,
+            sku=product.sku,
+            title=product.title,
+            old_stock=old_stock,
+            new_stock=stock,
+            old_status=old_status,
+            new_status=stock_status or old_status,
+            job_id=job_id,
+            created_at=utc_now(),
+        )
+        db.add(log_entry)
+        await db.commit()
+        await db.refresh(product)
+        return product, True
+
+    return product, False
+
+
+async def get_stock_update_logs(
+    db: AsyncSession,
+    since_hours: Optional[int] = None,
+    since_date: Optional[datetime] = None,
+    page: int = 1,
+    limit: int = 50,
+) -> Tuple[List[StockUpdateLog], int]:
+    """Fetch logged stock quantity updates with optional time filters."""
+    stmt = select(StockUpdateLog)
+
+    if since_hours:
+        cutoff = utc_now() - timedelta(hours=since_hours)
+        stmt = stmt.where(StockUpdateLog.created_at >= cutoff)
+    elif since_date:
+        stmt = stmt.where(StockUpdateLog.created_at >= since_date)
+
+    count_stmt = select(func.count()).select_from(stmt.subquery())
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    stmt = stmt.order_by(StockUpdateLog.created_at.desc())
+    stmt = stmt.offset((page - 1) * limit).limit(limit)
+
+    result = await db.execute(stmt)
+    logs = list(result.scalars().all())
+    return logs, total

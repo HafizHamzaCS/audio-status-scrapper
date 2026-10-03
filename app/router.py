@@ -20,6 +20,8 @@ from app.schemas import (
     ChangedProductsResponse,
     StatsOut,
     SyncResponse,
+    StockUpdateLogOut,
+    StockUpdatesResponse,
 )
 from app import crud
 from app.config import settings
@@ -689,3 +691,143 @@ async def sync_product_by_id(
         raise HTTPException(status_code=404, detail="Product not found")
     return await sync_product_by_sku(product.sku, db)
 
+
+
+# ---------------------------------------------------------------------------
+# Stock-Only 6-Hour Sync & WordPress Document Draft Endpoints
+# ---------------------------------------------------------------------------
+
+
+async def run_stock_only_sync_job(job_id: Optional[int] = None):
+    """Background task to fetch live stock for all products and update ONLY stock/status."""
+    from app.database import async_session_factory
+    from scraper.soundimports import SoundImportsScraper
+
+    logger.info("Stock-only sync started (job_id=%s)", job_id)
+    supplier = SoundImportsScraper()
+    try:
+        async with async_session_factory() as db:
+            if not job_id:
+                job_id = await crud.create_scrape_job(db, "stock_only")
+
+            products, _ = await crud.get_products_paginated(db, page=1, per_page=10000)
+            logger.info("Stock-only sync evaluating %d products", len(products))
+
+            updated_count = 0
+            for prod in products:
+                if not prod.url:
+                    continue
+                try:
+                    detail_data = await supplier.get_product_detail(prod.url)
+                    prod_data = supplier.extract_product_detail(detail_data)
+
+                    new_stock = prod_data.get("stock")
+                    new_status = prod_data.get("stock_status")
+
+                    _, changed = await crud.upsert_product_stock_only(
+                        db,
+                        sku=prod.sku,
+                        stock=new_stock,
+                        stock_status=new_status,
+                        job_id=job_id,
+                    )
+                    if changed:
+                        updated_count += 1
+                except Exception as exc:
+                    logger.warning("Stock sync failed for product %s: %s", prod.sku, exc)
+
+            await crud.update_scrape_job(
+                db,
+                job_id,
+                status="completed",
+                job_status="SUCCESS",
+                finished_at=utc_now(),
+                total_products=len(products),
+                updated_products=updated_count,
+            )
+            logger.info("Stock-only sync finished (job_id=%s): %d stock records updated", job_id, updated_count)
+    except Exception as e:
+        logger.exception("Stock-only sync failed (job_id=%s): %s", job_id, e)
+    finally:
+        await supplier._client.close()
+
+
+@router.post(
+    "/sync/stock-only",
+    response_model=SyncResponse,
+    summary="Trigger an immediate stock-only sync (updates stock quantity & status ONLY)",
+)
+async def trigger_stock_only_sync(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    job_id = await crud.create_scrape_job(db, "stock_only")
+    background_tasks.add_task(run_stock_only_sync_job, job_id)
+    return SyncResponse(
+        job_id=job_id,
+        status="running",
+        message=f"Stock-only sync started (job #{job_id})",
+    )
+
+
+@router.get(
+    "/stock-updates",
+    response_model=StockUpdatesResponse,
+    summary="List audit history of stock quantity updates",
+)
+async def list_stock_updates(
+    since_hours: Optional[int] = Query(None, description="Filter updates in last N hours"),
+    since: Optional[str] = Query(None, description="Date in YYYY-MM-DD format"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    since_date = None
+    if since:
+        try:
+            since_date = datetime.strptime(since, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    logs, total = await crud.get_stock_update_logs(
+        db, since_hours=since_hours, since_date=since_date, page=page, limit=limit
+    )
+    return StockUpdatesResponse(
+        total=total,
+        page=page,
+        limit=limit,
+        updates=[StockUpdateLogOut.model_validate(log) for log in logs],
+    )
+
+
+@router.get(
+    "/stock-updates/draft",
+    summary="WordPress plugin document draft endpoint returning formatted stock quantity updates",
+)
+async def get_stock_updates_draft_document(
+    since_hours: int = Query(24, description="Hours of stock history to include in document draft"),
+    db: AsyncSession = Depends(get_db),
+):
+    logs, total = await crud.get_stock_update_logs(
+        db, since_hours=since_hours, page=1, limit=5000
+    )
+    document_items = [
+        {
+            "product_id": log.product_id,
+            "sku": log.sku,
+            "title": log.title,
+            "old_stock": log.old_stock,
+            "new_stock": log.new_stock,
+            "old_status": log.old_status,
+            "new_status": log.new_status,
+            "updated_at": log.created_at.isoformat(),
+        }
+        for log in logs
+    ]
+    return {
+        "document_type": "stock_quantity_update_draft",
+        "generated_at": utc_now().isoformat(),
+        "total_updated_products": total,
+        "timeframe_hours": since_hours,
+        "items": document_items,
+    }
