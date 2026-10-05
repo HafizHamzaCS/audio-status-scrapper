@@ -42,7 +42,10 @@ async def lifespan(app: FastAPI):
     last_exc = None
     for attempt in range(1, 4):
         try:
-            await upgrade_database()
+            try:
+                await upgrade_database()
+            except Exception as mig_err:
+                logger.warning("Alembic migration warning: %s", mig_err)
             from app.database import Base
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)

@@ -1,10 +1,10 @@
-﻿\"\"\"Add stock_update_logs table for tracking stock quantity and status changes.
+"""Add stock_update_logs table for tracking stock quantity and status changes.
 
 Revision ID: 005
 Revises: 004
 Create Date: 2026-10-05
 
-\"\"\"
+"""
 
 from alembic import op
 import sqlalchemy as sa

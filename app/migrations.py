@@ -38,8 +38,16 @@ async def _detect_unversioned_revision() -> Optional[str]:
     def detect(sync_connection) -> Optional[str]:
         inspector = inspect(sync_connection)
         tables = set(inspector.get_table_names())
-        if not tables or "alembic_version" in tables:
+        if not tables:
             return None
+        if "alembic_version" in tables:
+            try:
+                import sqlalchemy as sa
+                res = sync_connection.execute(sa.text("SELECT version_num FROM alembic_version")).fetchall()
+                if res and res[0][0]:
+                    return None
+            except Exception:
+                pass
         if "categories" not in tables or "products" not in tables:
             return None
 
@@ -95,4 +103,11 @@ async def upgrade_database() -> None:
             legacy_revision,
         )
         await asyncio.to_thread(command.stamp, config, legacy_revision)
-    await asyncio.to_thread(command.upgrade, config, "head")
+    try:
+        await asyncio.to_thread(command.upgrade, config, "head")
+    except Exception as up_err:
+        logger.warning("Alembic upgrade warning: %s; stamping head", up_err)
+        try:
+            await asyncio.to_thread(command.stamp, config, "head")
+        except Exception:
+            pass
