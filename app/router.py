@@ -761,13 +761,39 @@ async def trigger_stock_only_sync(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
-    job_id = await crud.create_scrape_job(db, "stock_only")
-    background_tasks.add_task(run_stock_only_sync_job, job_id)
-    return SyncResponse(
-        job_id=job_id,
-        status="running",
-        message=f"Stock-only sync started (job #{job_id})",
-    )
+    try:
+        job_id, claim_state = await crud.create_or_resume_scrape_job(
+            db, "stock_only", settings.job_stale_after
+        )
+        logger.info(
+            "Stock-only sync trigger: job_id=%d, claim=%s",
+            job_id,
+            claim_state,
+        )
+
+        if claim_state == "already_running":
+            return SyncResponse(
+                job_id=job_id,
+                status="running",
+                message=f"Stock-only scrape job #{job_id} is already running",
+            )
+
+        background_tasks.add_task(run_stock_only_sync_job, job_id)
+
+        return SyncResponse(
+            job_id=job_id,
+            status="running",
+            message=(
+                f"Stock-only scrape "
+                f"{'resumed' if claim_state == 'resumed' else 'started'} (job #{job_id})"
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Failed to trigger stock-only sync: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start stock-only sync job: {exc}",
+        )
 
 
 @router.get(
@@ -789,15 +815,24 @@ async def list_stock_updates(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    logs, total = await crud.get_stock_update_logs(
-        db, since_hours=since_hours, since_date=since_date, page=page, limit=limit
-    )
-    return StockUpdatesResponse(
-        total=total,
-        page=page,
-        limit=limit,
-        updates=[StockUpdateLogOut.model_validate(log) for log in logs],
-    )
+    try:
+        logs, total = await crud.get_stock_update_logs(
+            db, since_hours=since_hours, since_date=since_date, page=page, limit=limit
+        )
+        return StockUpdatesResponse(
+            total=total,
+            page=page,
+            limit=limit,
+            updates=[StockUpdateLogOut.model_validate(log) for log in logs],
+        )
+    except Exception as exc:
+        logger.warning("Could not query stock_update_logs: %s", exc)
+        return StockUpdatesResponse(
+            total=0,
+            page=page,
+            limit=limit,
+            updates=[],
+        )
 
 
 @router.get(

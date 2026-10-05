@@ -842,9 +842,22 @@ async def create_scrape_job(db: AsyncSession, job_type: str) -> int:
         heartbeat_at=now,
     )
     db.add(job)
-    await db.commit()
-    await db.refresh(job)
-    return job.id
+    try:
+        await db.commit()
+        await db.refresh(job)
+        return job.id
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.execute(
+            select(ScrapeJob)
+            .where(ScrapeJob.active_key == ACTIVE_SCRAPE_KEY)
+            .order_by(ScrapeJob.id.desc())
+            .limit(1)
+        )
+        active_job = existing.scalar_one_or_none()
+        if active_job:
+            return active_job.id
+        raise
 
 
 async def create_or_resume_scrape_job(
@@ -860,7 +873,6 @@ async def create_or_resume_scrape_job(
     running_result = await db.execute(
         select(ScrapeJob)
         .where(
-            ScrapeJob.job_type == job_type,
             ScrapeJob.status == "running",
         )
         .order_by(ScrapeJob.id.desc())

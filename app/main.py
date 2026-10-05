@@ -43,6 +43,9 @@ async def lifespan(app: FastAPI):
     for attempt in range(1, 4):
         try:
             await upgrade_database()
+            from app.database import Base
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
             from app import telemetry
 
             await telemetry.create_telemetry_table()
