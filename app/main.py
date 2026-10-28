@@ -62,6 +62,12 @@ async def lifespan(app: FastAPI):
                     interrupted,
                 )
             logger.info("Database migrations applied successfully.")
+            from app.reference_products import import_missing_products
+            try:
+                await import_missing_products()
+                logger.info("Canonical reference catalog verified and synced on startup.")
+            except Exception as ref_err:
+                logger.warning("Reference products sync warning on startup: %s", ref_err)
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc

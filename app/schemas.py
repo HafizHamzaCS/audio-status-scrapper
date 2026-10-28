@@ -160,10 +160,26 @@ def _category_path_from_orm(product: Product):
         return parts
 
     best = max(cats, key=lambda c: (len(path_slugs(c)), c.slug or ""))
-    slugs = path_slugs(best)
+    best_slugs = path_slugs(best)
+    primary = format_category_name(best_slugs[-1]) if best_slugs else format_category_name(best.slug)
+
+    slugs = list(best_slugs)
     names = [format_category_name(s) for s in slugs]
+
+    # Include all associated categories (e.g. promotional, brand, secondary)
+    for c in cats:
+        c_slugs = path_slugs(c)
+        for s in c_slugs:
+            if s not in slugs:
+                slugs.append(s)
+                names.append(format_category_name(s))
+        if c.slug and c.slug not in slugs:
+            slugs.append(c.slug)
+        if c.name and c.name not in names:
+            names.append(c.name)
+
     return (
-        names[-1] if names else format_category_name(best.slug),
+        primary,
         names,
         slugs,
     )

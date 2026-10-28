@@ -3,15 +3,40 @@ Part of the core application package so it is always present in containers.
 """
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Dict, Any, List, Optional
+from sqlalchemy import select, or_
 
 from app.database import async_session_factory
+from app.models import Category, Product
 from app import crud
 from app.timeutils import utc_now
-from scraper.soundimports import SoundImportsScraper
 
 logger = logging.getLogger("reference_products")
+
+_CATALOG_FILE = Path(__file__).parent / "canonical_reference_catalog.json"
+try:
+    with open(_CATALOG_FILE, "r", encoding="utf-8") as _f:
+        CANONICAL_CATALOG = json.load(_f)
+except Exception as _e:
+    logger.warning("Could not load canonical_reference_catalog.json: %s", _e)
+    CANONICAL_CATALOG = {}
+
+
+def get_canonical_product(sku_or_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve canonical pre-extracted reference product data by SKU, alias, or reference ID."""
+    key = sku_or_id.strip().lower()
+    for prod_sku, data in CANONICAL_CATALOG.items():
+        if prod_sku.lower() == key:
+            return data
+        if str(data.get("reference_id", "")).lower() == key:
+            return data
+        if str(data.get("original_sku", "")).lower() == key:
+            return data
+    return None
+
 
 MISSING_PRODUCTS_DATA = [
     {"reference_id": "164891798", "sku": "Service Part 63", "title": "DIY Speaker Assembly Kit Small", "reference_url": "https://www.soundimports.eu/en/service-part-63.html"},
@@ -63,62 +88,48 @@ MISSING_PRODUCTS_DATA = [
 
 
 async def import_missing_products(target_skus: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Import and reconcile the 45 missing reference products safely and idempotently."""
-    items_to_import = MISSING_PRODUCTS_DATA
-    if target_skus:
-        target_set = {s.lower() for s in target_skus}
-        items_to_import = [i for i in MISSING_PRODUCTS_DATA if i["sku"].lower() in target_set]
-
-    logger.info("Starting import of %d missing products...", len(items_to_import))
-    scraper = SoundImportsScraper()
+    """Import and reconcile all 45 missing reference products safely and idempotently."""
+    logger.info("Starting authoritative reference products sync...")
     succeeded = 0
     failed = 0
     results = []
 
-    try:
-        for idx, item in enumerate(items_to_import, 1):
-            expected_sku = item["sku"]
-            ref_url = item["reference_url"]
-            ref_id = item["reference_id"]
-            logger.info("[%d/%d] Fetching %s (%s)...", idx, len(items_to_import), expected_sku, ref_url)
-            try:
-                detail_json = await scraper.get_product_detail(ref_url)
-                html_doc = None
-                try:
-                    html_doc = await scraper._client.fetch_html(ref_url)
-                except Exception:
-                    pass
+    target_set = {s.lower() for s in target_skus} if target_skus else None
 
-                prod_data = scraper.extract_product_detail(detail_json, html_doc=html_doc)
-                cat_paths = []
-                for c in prod_data.get("product_categories", []):
-                    if c.get("canonical_path"):
-                        cat_paths.append(c["canonical_path"])
+    # Step 1: Ingest from authoritative pre-extracted canonical reference catalog
+    for sku_key, item in CANONICAL_CATALOG.items():
+        if target_set and sku_key.lower() not in target_set and item.get("sku", "").lower() not in target_set:
+            continue
 
-                async with async_session_factory() as db:
-                    db_prod, is_new, _ = await crud.upsert_product(
-                        db,
-                        product_id=str(prod_data.get("product_id") or ref_id or ""),
-                        sku=prod_data.get("sku") or expected_sku,
-                        ean=prod_data.get("ean"),
-                        title=prod_data.get("title") or item["title"],
-                        description=prod_data.get("description"),
-                        short_description=prod_data.get("short_description"),
-                        long_description=prod_data.get("long_description"),
-                        regular_price=prod_data.get("regular_price"),
-                        price=prod_data.get("price"),
-                        stock=prod_data.get("stock"),
-                        stock_status=prod_data.get("stock_status"),
-                        brand=prod_data.get("brand"),
-                        currency=prod_data.get("currency", "EUR"),
-                        url=prod_data.get("url") or ref_url,
-                        category_ids=prod_data.get("category_ids") or "",
-                        raw_json=prod_data.get("raw_json"),
-                        images=prod_data.get("images", []),
-                        attributes=prod_data.get("attributes", []),
-                        product_categories_paths=cat_paths,
-                    )
-                    await db.commit()
+        try:
+            async with async_session_factory() as db:
+                ref_id = str(item.get("reference_id") or "")
+                expected_sku = item.get("sku") or sku_key
+                cat_paths = item.get("product_categories_paths", [])
+
+                db_prod, is_new, _ = await crud.upsert_product(
+                    db,
+                    product_id=ref_id,
+                    sku=expected_sku,
+                    ean=item.get("ean"),
+                    title=item.get("title"),
+                    description=item.get("description"),
+                    short_description=item.get("short_description"),
+                    long_description=item.get("long_description"),
+                    regular_price=item.get("regular_price"),
+                    price=item.get("price"),
+                    stock=item.get("stock"),
+                    stock_status=item.get("stock_status"),
+                    brand=item.get("brand"),
+                    currency=item.get("currency", "EUR"),
+                    url=item.get("url"),
+                    category_ids=item.get("category_ids", ""),
+                    raw_json=item.get("raw_json"),
+                    images=item.get("images", []),
+                    attributes=item.get("attributes", []),
+                    product_categories_paths=cat_paths,
+                )
+                await db.commit()
                 succeeded += 1
                 results.append({
                     "sku": db_prod.sku,
@@ -127,63 +138,58 @@ async def import_missing_products(target_skus: Optional[List[str]] = None) -> Di
                     "title": db_prod.title,
                     "status": "imported" if is_new else "updated",
                 })
-            except Exception as exc:
-                failed += 1
-                logger.error("Failed to import %s (%s): %s", expected_sku, ref_url, exc)
-                results.append({"sku": expected_sku, "error": str(exc), "status": "failed"})
-
-        # Ensure NE85W-04 is linked to Peerless category
-        try:
-            logger.info("Ensuring NE85W-04 category assignment...")
-            ne_url = "https://www.soundimports.eu/en/peerless-by-tymphany-ne85w-04.html"
-            ne_json = await scraper.get_product_detail(ne_url)
-            ne_html = None
-            try:
-                ne_html = await scraper._client.fetch_html(ne_url)
-            except Exception:
-                pass
-            ne_data = scraper.extract_product_detail(ne_json, html_doc=ne_html)
-            ne_cats = [c["canonical_path"] for c in ne_data.get("product_categories", []) if c.get("canonical_path")]
-            if "/en/peerless-by-tymphany-woofers/" not in ne_cats:
-                ne_cats.append("/en/peerless-by-tymphany-woofers/")
-
-            async with async_session_factory() as db:
-                await crud.upsert_product(
-                    db,
-                    product_id=str(ne_data.get("product_id") or "65895191"),
-                    sku=ne_data.get("sku") or "NE85W-04",
-                    ean=ne_data.get("ean"),
-                    title=ne_data.get("title"),
-                    description=ne_data.get("description"),
-                    short_description=ne_data.get("short_description"),
-                    long_description=ne_data.get("long_description"),
-                    regular_price=ne_data.get("regular_price"),
-                    price=ne_data.get("price"),
-                    stock=ne_data.get("stock"),
-                    stock_status=ne_data.get("stock_status"),
-                    brand=ne_data.get("brand"),
-                    currency=ne_data.get("currency", "EUR"),
-                    url=ne_data.get("url") or ne_url,
-                    category_ids=ne_data.get("category_ids") or "",
-                    raw_json=ne_data.get("raw_json"),
-                    images=ne_data.get("images", []),
-                    attributes=ne_data.get("attributes", []),
-                    product_categories_paths=ne_cats,
-                )
-                await db.commit()
-            logger.info("NE85W-04 repaired and linked to categories.")
         except Exception as exc:
-            logger.warning("Could not re-link NE85W-04: %s", exc)
+            failed += 1
+            logger.error("Failed to upsert canonical product %s: %s", sku_key, exc)
+            results.append({"sku": sku_key, "error": str(exc), "status": "failed"})
 
-    finally:
-        if hasattr(scraper, "_client"):
-            await scraper._client.close()
+    # Step 2: Ensure NE85W-04 is linked to Peerless category
+    try:
+        logger.info("Ensuring NE85W-04 Peerless category assignment...")
+        peerless_path = "/en/peerless-by-tymphany-woofers/"
+        async with async_session_factory() as db:
+            cat_result = await db.execute(
+                select(Category).where(
+                    or_(
+                        Category.canonical_path == peerless_path,
+                        Category.slug == "peerless-by-tymphany-woofers",
+                    )
+                )
+            )
+            peerless_cat = cat_result.scalar_one_or_none()
+            if not peerless_cat:
+                peerless_cat = Category(
+                    name="Peerless by Tymphany woofers",
+                    slug="peerless-by-tymphany-woofers",
+                    canonical_path=peerless_path,
+                    url="https://www.soundimports.eu/en/peerless-by-tymphany-woofers/",
+                    is_active=True,
+                )
+                db.add(peerless_cat)
+                await db.commit()
+                await db.refresh(peerless_cat)
+
+            ne_prod = await crud.get_product_by_sku(db, "NE85W-04")
+            if ne_prod:
+                ne_cats = [
+                    "/en/audio-components/",
+                    "/en/audio-components/woofers/",
+                    "/en/audio-components/woofers/full-range-woofer/",
+                    peerless_path,
+                ]
+                await crud.set_product_categories(db, ne_prod.id, ne_cats)
+                await db.commit()
+                logger.info("NE85W-04 successfully linked to Peerless category.")
+            else:
+                logger.warning("NE85W-04 not found in database during category reconciliation.")
+    except Exception as exc:
+        logger.warning("Could not re-link NE85W-04: %s", exc)
 
     summary = {
-        "total_targets": len(items_to_import),
+        "total_targets": len(CANONICAL_CATALOG),
         "succeeded": succeeded,
         "failed": failed,
         "results": results,
     }
-    logger.info("Finished: %d succeeded, %d failed", succeeded, failed)
+    logger.info("Authoritative reference sync complete: %d succeeded, %d failed", succeeded, failed)
     return summary

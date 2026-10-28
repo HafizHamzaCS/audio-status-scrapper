@@ -300,3 +300,53 @@ async def test_cursor_pagination_stability(session_factory):
         p1_ids = {p.id for p in page1}
         p2_ids = {p.id for p in page2}
         assert p1_ids.isdisjoint(p2_ids)
+
+
+@pytest.mark.asyncio
+async def test_import_missing_reference_products_and_ne85w04(session_factory, monkeypatch):
+    monkeypatch.setattr("app.reference_products.async_session_factory", session_factory)
+
+    from app.reference_products import import_missing_products, CANONICAL_CATALOG
+    from app.schemas import ProductDetail
+
+    async with session_factory() as db:
+        # Pre-seed NE85W-04 without Peerless category
+        await crud.upsert_product(
+            db,
+            product_id="65895191",
+            sku="NE85W-04",
+            ean=None,
+            title="NE85W-04 2.5\" Full Range Woofer",
+            description=None,
+            long_description=None,
+            price=39.95,
+            stock=10,
+            stock_status="in_stock",
+            brand="Peerless by Tymphany",
+            currency="EUR",
+            url="https://www.soundimports.eu/en/peerless-by-tymphany-ne85w-04.html",
+            category_ids="",
+            raw_json=None,
+            images=[],
+            attributes=[],
+            product_categories_paths=["/en/audio-components/woofers/full-range-woofer/"],
+        )
+        await db.commit()
+
+    # Run reference import
+    summary = await import_missing_products()
+    assert summary["succeeded"] == len(CANONICAL_CATALOG)
+    assert summary["failed"] == 0
+
+    async with session_factory() as db:
+        # Check XBS25-4-bundle
+        prod_xbs = await crud.get_product_by_sku(db, "XBS25-4-bundle")
+        assert prod_xbs is not None
+        assert prod_xbs.product_id == "164647193"
+
+        # Check NE85W-04 category assignment
+        ne_prod = await crud.get_product_by_sku(db, "NE85W-04")
+        assert ne_prod is not None
+        detail = ProductDetail.model_validate(ne_prod)
+        assert any("peerless" in c.lower() for c in detail.categories)
+        assert any("peerless" in s.lower() for s in detail.category_slugs)
