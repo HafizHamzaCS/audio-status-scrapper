@@ -379,6 +379,31 @@ async def get_product_by_sku(
     sku = unquote(sku)
     product = await crud.get_product_by_sku(db, sku)
     if not product:
+        try:
+            from scripts.import_missing_reference_products import MISSING_PRODUCTS_DATA
+            from scraper.soundimports import SoundImportsScraper
+
+            target = next(
+                (item for item in MISSING_PRODUCTS_DATA if item["sku"].lower() == sku.lower()),
+                None,
+            )
+            p_url = target["reference_url"] if target else f"{settings.base_url.rstrip('/')}/en/{sku.lower()}.html"
+            supplier = SoundImportsScraper()
+            detail_data = await supplier.get_product_detail(p_url)
+            html_doc = None
+            try:
+                html_doc = await supplier._client.fetch_html(p_url)
+            except Exception:
+                pass
+            prod_data = supplier.extract_product_detail(detail_data, html_doc=html_doc)
+            if prod_data:
+                product = await crud.upsert_product_robust(db, prod_data)
+                await db.commit()
+                await db.refresh(product)
+        except Exception as exc:
+            logger.debug("On-demand fetch for SKU %s failed: %s", sku, exc)
+
+    if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     if product.url and _needs_enrichment(product):
         product = await _enrich_product_if_needed(db, product)
@@ -555,7 +580,18 @@ async def sync_missing_products_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     from scripts.import_missing_reference_products import import_missing_products
-    job_id = await crud.create_scrape_job(db, "missing_products_sync")
+    job = ScrapeJob(
+        job_type="missing_products_sync",
+        active_key=None,
+        status="running",
+        job_status="RUNNING",
+        started_at=utc_now(),
+        heartbeat_at=utc_now(),
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    job_id = job.id
 
     async def _run_import(job_id: int):
         try:
