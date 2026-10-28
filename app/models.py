@@ -96,6 +96,8 @@ class Product(Base):
     product_id = Column(String(100), nullable=True)
     sku = Column(String(200), nullable=False, unique=True)
     ean = Column(String(50), nullable=True)
+    ean_valid = Column(Boolean, nullable=True)
+    ean_error = Column(String(200), nullable=True)
     title = Column(String(1000), nullable=True)
     short_description = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
@@ -111,7 +113,13 @@ class Product(Base):
     # compatibility only. Relationship data lives in ``product_categories``.
     category_ids = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
+    missing_streak = Column(Integer, nullable=False, default=0)
+    content_hash = Column(String(64), nullable=True)
     raw_json = Column(Text, nullable=True)
+    discovered_at = Column(DateTime, default=utc_now)
+    content_updated_at = Column(DateTime, default=utc_now)
+    stock_updated_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -136,6 +144,9 @@ class Product(Base):
         Index("idx_products_brand", "brand"),
         Index("idx_products_updated", "updated_at"),
         Index("idx_products_product_id", "product_id"),
+        Index("idx_products_content_updated", "content_updated_at"),
+        Index("idx_products_stock_updated", "stock_updated_at"),
+        Index("idx_products_last_seen", "last_seen_at"),
     )
 
 

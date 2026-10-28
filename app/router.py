@@ -1,3 +1,4 @@
+import base64
 import logging
 from datetime import datetime
 from typing import Optional, List
@@ -18,6 +19,8 @@ from app.schemas import (
     SpecificationOut,
     ProductsResponse,
     ChangedProductsResponse,
+    ProductDeltaResponse,
+    ProductDeltaItem,
     StatsOut,
     SyncResponse,
     StockUpdateLogOut,
@@ -240,6 +243,7 @@ async def list_brands(
 async def list_products(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    cursor: Optional[str] = Query(None, description="Opaque cursor for keyset pagination"),
     brand: Optional[str] = None,
     category: Optional[str] = None,
     search: Optional[str] = None,
@@ -257,6 +261,14 @@ async def list_products(
             status_code=422,
             detail="Invalid stock_status. Use: in_stock, out_of_stock, on_backorder",
         )
+
+    after_id = None
+    if cursor:
+        try:
+            after_id = int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+
     products, total = await crud.get_products_paginated(
         db,
         page=page,
@@ -267,6 +279,7 @@ async def list_products(
         stock_status=stock_status,
         sort_by=sort_by,
         sort_order=sort_order,
+        after_id=after_id,
     )
 
     # Auto-enrich products where stock or specifications are unpopulated
@@ -281,11 +294,20 @@ async def list_products(
                 enriched_products.append(p)
         products = enriched_products
 
+    has_more = (len(products) == limit) and (after_id is not None or (page * limit < total))
+    next_cursor = (
+        base64.urlsafe_b64encode(str(products[-1].id).encode("utf-8")).decode("ascii")
+        if products and has_more
+        else None
+    )
+
     return ProductsResponse(
         total=total,
         page=page,
         limit=limit,
         products=[ProductListItem.model_validate(p) for p in products],
+        next_cursor=next_cursor,
+        has_more=has_more,
     )
 
 
@@ -388,6 +410,12 @@ async def get_stats(
     db: AsyncSession = Depends(get_db),
 ):
     total_products = (await db.execute(select(func.count(Product.id)))).scalar() or 0
+    active_products = (
+        await db.execute(select(func.count(Product.id)).where(Product.is_active.is_(True)))
+    ).scalar() or 0
+    missing_streak_products = (
+        await db.execute(select(func.count(Product.id)).where(Product.missing_streak > 0))
+    ).scalar() or 0
     total_categories = (await db.execute(select(func.count(Category.id)))).scalar() or 0
     total_brands = (
         await db.execute(
@@ -410,11 +438,44 @@ async def get_stats(
         else None
     )
 
+    last_discovery = await db.execute(
+        select(ScrapeJob)
+        .where(
+            ScrapeJob.status == "completed",
+            ScrapeJob.job_type.in_(["full", "incremental", "discovery", "missing_products_sync"]),
+        )
+        .order_by(ScrapeJob.finished_at.desc())
+        .limit(1)
+    )
+    last_discovery_job = last_discovery.scalar_one_or_none()
+    last_successful_discovery = (
+        last_discovery_job.finished_at.isoformat()
+        if last_discovery_job and last_discovery_job.finished_at
+        else None
+    )
+
+    last_stock = await db.execute(
+        select(ScrapeJob)
+        .where(ScrapeJob.status == "completed", ScrapeJob.job_type == "stock_only")
+        .order_by(ScrapeJob.finished_at.desc())
+        .limit(1)
+    )
+    last_stock_job = last_stock.scalar_one_or_none()
+    last_successful_stock_sync = (
+        last_stock_job.finished_at.isoformat()
+        if last_stock_job and last_stock_job.finished_at
+        else None
+    )
+
     return StatsOut(
         total_products=total_products,
         total_categories=total_categories,
         total_brands=total_brands,
         last_sync=last_sync,
+        last_successful_discovery=last_successful_discovery,
+        last_successful_stock_sync=last_successful_stock_sync,
+        active_products=active_products,
+        missing_streak_products=missing_streak_products,
     )
 
 
@@ -424,6 +485,111 @@ async def telemetry(limit: int = Query(60, le=500)):
 
     return await _telemetry.read_telemetry(limit=limit)
 
+
+@router.get("/products/delta", response_model=ProductDeltaResponse, summary="Stable cursor-based delta feed of changed products")
+async def get_products_delta(
+    cursor: Optional[str] = Query(None, description="Opaque cursor for delta stream"),
+    since: Optional[str] = Query(None, description="ISO timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    since_date = None
+    if since:
+        try:
+            since_date = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                since_date = datetime.strptime(since, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format or YYYY-MM-DD.")
+
+    after_id = None
+    if cursor:
+        try:
+            after_id = int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+
+    products, total = await crud.get_delta_products(db, after_id=after_id, since_date=since_date, limit=limit)
+    has_more = len(products) == limit
+    next_cursor = (
+        base64.urlsafe_b64encode(str(products[-1].id).encode("utf-8")).decode("ascii")
+        if products and has_more
+        else None
+    )
+
+    items = [
+        ProductDeltaItem(
+            id=p.id,
+            product_id=p.product_id,
+            sku=p.sku,
+            title=p.title,
+            price=p.price,
+            stock=p.stock,
+            stock_status=p.stock_status,
+            is_active=p.is_active,
+            content_updated_at=p.content_updated_at.isoformat() if p.content_updated_at else (p.updated_at.isoformat() if p.updated_at else None),
+            stock_updated_at=p.stock_updated_at.isoformat() if p.stock_updated_at else None,
+            last_seen_at=p.last_seen_at.isoformat() if p.last_seen_at else None,
+        )
+        for p in products
+    ]
+
+    return ProductDeltaResponse(
+        total=total,
+        limit=limit,
+        cursor=cursor,
+        next_cursor=next_cursor,
+        has_more=has_more,
+        items=items,
+    )
+
+
+@router.post(
+    "/sync/missing-products",
+    response_model=SyncResponse,
+    summary="Import and reconcile the 45 missing reference products immediately",
+)
+async def sync_missing_products_endpoint(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    from scripts.import_missing_reference_products import import_missing_products
+    job_id = await crud.create_scrape_job(db, "missing_products_sync")
+
+    async def _run_import(job_id: int):
+        try:
+            summary = await import_missing_products()
+            from app.database import async_session_factory
+            async with async_session_factory() as session:
+                await crud.update_scrape_job(
+                    session,
+                    job_id,
+                    status="completed",
+                    job_status="SUCCESS",
+                    finished_at=utc_now(),
+                    total_products=summary["total_targets"],
+                    new_products=summary["succeeded"],
+                    summary=f"Imported {summary['succeeded']} products, {summary['failed']} failed",
+                )
+        except Exception as exc:
+            from app.database import async_session_factory
+            async with async_session_factory() as session:
+                await crud.update_scrape_job(
+                    session,
+                    job_id,
+                    status="failed",
+                    job_status="FAILED",
+                    finished_at=utc_now(),
+                    errors=str(exc),
+                )
+
+    background_tasks.add_task(_run_import, job_id)
+    return SyncResponse(
+        job_id=job_id,
+        status="running",
+        message=f"Missing reference products import initiated (job #{job_id})",
+    )
 
 @router.post("/sync", response_model=SyncResponse)
 async def trigger_sync(

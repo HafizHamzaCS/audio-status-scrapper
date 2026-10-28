@@ -180,6 +180,7 @@ def _legacy_category_info(data):
 
 class ProductListItem(BaseModel):
     id: int
+    product_id: Optional[str] = None
     sku: str
     title: Optional[str] = None
     regular_price: Optional[float] = None
@@ -215,6 +216,7 @@ class ProductListItem(BaseModel):
             ]
             return {
                 "id": data.id,
+                "product_id": getattr(data, "product_id", None),
                 "sku": data.sku,
                 "title": data.title,
                 "regular_price": data.regular_price
@@ -265,6 +267,7 @@ class ProductListItem(BaseModel):
 
 class ProductDetail(BaseModel):
     id: int
+    product_id: Optional[str] = None
     sku: str
     title: Optional[str] = None
     regular_price: Optional[float] = None
@@ -300,6 +303,7 @@ class ProductDetail(BaseModel):
             ]
             return {
                 "id": data.id,
+                "product_id": getattr(data, "product_id", None),
                 "sku": data.sku,
                 "title": data.title,
                 "regular_price": data.regular_price
@@ -362,6 +366,7 @@ class ProductDescriptionOut(BaseModel):
         if isinstance(data, Product):
             return {
                 "id": data.id,
+                "product_id": getattr(data, "product_id", None),
                 "sku": data.sku,
                 "title": data.title,
                 "regular_price": data.regular_price
@@ -384,6 +389,8 @@ class ProductsResponse(BaseModel):
     page: int
     limit: int
     products: List[ProductListItem]
+    next_cursor: Optional[str] = None
+    has_more: Optional[bool] = None
 
 
 class ChangedProductsResponse(BaseModel):
@@ -397,6 +404,33 @@ class StatsOut(BaseModel):
     total_categories: int
     total_brands: int
     last_sync: Optional[str] = None
+    last_successful_discovery: Optional[str] = None
+    last_successful_stock_sync: Optional[str] = None
+    active_products: Optional[int] = None
+    missing_streak_products: Optional[int] = None
+
+
+class ProductDeltaItem(BaseModel):
+    id: int
+    product_id: Optional[str] = None
+    sku: str
+    title: Optional[str] = None
+    price: Optional[float] = None
+    stock: Optional[int] = None
+    stock_status: Optional[str] = None
+    is_active: bool = True
+    content_updated_at: Optional[str] = None
+    stock_updated_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+
+
+class ProductDeltaResponse(BaseModel):
+    total: int
+    limit: int
+    cursor: Optional[str] = None
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    items: List[ProductDeltaItem]
 
 
 class SyncResponse(BaseModel):

@@ -71,6 +71,27 @@ class SitemapParser:
         logger.info("Discovered %d categories from sitemap", len(categories))
         return categories
 
+    async def discover_product_urls(self) -> List[str]:
+        """Fetch XML sitemap and extract all product canonical URLs."""
+        xml_url = urljoin(settings.base_url, "/en/sitemap.xml")
+        try:
+            xml_text = await self.client.fetch_html(xml_url)
+            soup = BeautifulSoup(xml_text, "xml")
+            product_urls = []
+            for loc in soup.find_all("loc"):
+                url_str = loc.get_text(strip=True)
+                if (
+                    url_str.startswith("https://www.soundimports.eu/en/")
+                    and url_str.endswith(".html")
+                    and not any(excl in url_str.lower() for excl in self.EXCLUDED_PATHS)
+                ):
+                    product_urls.append(url_str)
+            logger.info("Discovered %d product URLs from XML sitemap", len(product_urls))
+            return product_urls
+        except Exception as exc:
+            logger.warning("XML sitemap product URL discovery error: %s", exc)
+            return []
+
     async def _discover_xml_categories(self) -> List[Dict[str, Any]]:
         xml_url = urljoin(settings.base_url, "/en/sitemap.xml")
         try:

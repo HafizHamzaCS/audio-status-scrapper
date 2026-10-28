@@ -1,3 +1,5 @@
+import logging
+import hashlib
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any, Set
 from sqlalchemy import select, func, and_, delete
@@ -18,6 +20,7 @@ from app.models import (
 from app.timeutils import utc_now
 
 ACTIVE_SCRAPE_KEY = "scrape"
+logger = logging.getLogger("app.crud")
 
 # ---------------------------------------------------------------------------
 # Category lookup
@@ -418,11 +421,11 @@ def _apply_sorting(query, sort_by: Optional[str], sort_order: Optional[str]):
     if sort_by and sort_by in SORTABLE_COLUMNS:
         col = getattr(Product, SORTABLE_COLUMNS[sort_by])
         if sort_order and sort_order.lower() == "asc":
-            query = query.order_by(col.asc())
+            query = query.order_by(col.asc(), Product.id.asc())
         else:
-            query = query.order_by(col.desc())
+            query = query.order_by(col.desc(), Product.id.desc())
     else:
-        query = query.order_by(Product.updated_at.desc())
+        query = query.order_by(Product.id.asc())
     return query
 
 
@@ -461,6 +464,7 @@ async def get_products_paginated(
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
     include_children: bool = False,
+    after_id: Optional[int] = None,
 ) -> Tuple[List[Product], int]:
     query = select(Product)
     count_query = select(func.count(func.distinct(Product.id)))
@@ -484,15 +488,15 @@ async def get_products_paginated(
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
-    query = _apply_sorting(query, sort_by, sort_order)
-    query = (
-        query.offset((page - 1) * per_page)
-        .limit(per_page)
-        .options(
-            selectinload(Product.images),
-            selectinload(Product.attributes_rel),
-            selectinload(Product.categories),
-        )
+    if after_id is not None:
+        query = query.where(Product.id > after_id).order_by(Product.id.asc()).limit(per_page)
+    else:
+        query = _apply_sorting(query, sort_by, sort_order).offset((page - 1) * per_page).limit(per_page)
+
+    query = query.options(
+        selectinload(Product.images),
+        selectinload(Product.attributes_rel),
+        selectinload(Product.categories),
     )
 
     result = await db.execute(query)
@@ -538,9 +542,11 @@ async def get_product_by_id(db: AsyncSession, product_id: int) -> Optional[Produ
 
 
 async def get_product_by_sku(db: AsyncSession, sku: str) -> Optional[Product]:
+    from urllib.parse import unquote
+    clean_sku = unquote(sku).strip()
     stmt = (
         select(Product)
-        .where(Product.sku == sku)
+        .where(Product.sku == clean_sku)
         .options(
             selectinload(Product.images),
             selectinload(Product.attributes_rel),
@@ -548,7 +554,19 @@ async def get_product_by_sku(db: AsyncSession, sku: str) -> Optional[Product]:
         )
     )
     result = await db.execute(stmt)
-    return result.scalar_one_or_none()
+    prod = result.scalar_one_or_none()
+    if prod:
+        return prod
+    stmt_ci = (
+        select(Product)
+        .where(func.lower(Product.sku) == func.lower(clean_sku))
+        .options(
+            selectinload(Product.images),
+            selectinload(Product.attributes_rel),
+            selectinload(Product.categories),
+        )
+    )
+    return (await db.execute(stmt_ci)).scalars().first()
 
 
 async def get_all_products(db: AsyncSession) -> List[Product]:
@@ -660,8 +678,12 @@ async def get_coverage_snapshot(db: AsyncSession) -> Dict[str, Any]:
 async def get_changed_products_since(db: AsyncSession, since: datetime) -> List[int]:
     stmt = (
         select(Product.id)
-        .where(Product.updated_at >= since)
-        .order_by(Product.updated_at.desc())
+        .where(
+            (Product.content_updated_at >= since)
+            | (Product.stock_updated_at >= since)
+            | ((Product.content_updated_at.is_(None)) & (Product.updated_at >= since))
+        )
+        .order_by(Product.id.asc())
     )
     result = await db.execute(stmt)
     return [row[0] for row in result]
@@ -681,6 +703,61 @@ async def get_brands(db: AsyncSession) -> List[dict]:
 # ---------------------------------------------------------------------------
 # Product upsert
 # ---------------------------------------------------------------------------
+
+def validate_gtin(barcode: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Validate GTIN-8, GTIN-12 (UPC-A), GTIN-13 (EAN-13), GTIN-14 check digit."""
+    if not barcode:
+        return True, None
+    raw = str(barcode).strip()
+    if not raw.isdigit():
+        return False, f"Barcode contains non-digit characters: {raw}"
+    if len(raw) not in (8, 12, 13, 14):
+        return False, f"Barcode length {len(raw)} is not a standard GTIN length (8, 12, 13, 14)"
+    digits = [int(d) for d in raw]
+    check = digits[-1]
+    payload = digits[:-1]
+    weights = [3 if i % 2 == 0 else 1 for i in range(len(payload))]
+    weighted_sum = sum(d * w for d, w in zip(reversed(payload), weights))
+    expected = (10 - (weighted_sum % 10)) % 10
+    if check != expected:
+        return False, f"Invalid check digit: expected {expected}, got {check}"
+    return True, None
+
+
+def compute_content_hash(
+    title: Optional[str],
+    short_description: Optional[str],
+    description: Optional[str],
+    long_description: Optional[str],
+    price: Optional[float],
+    regular_price: Optional[float],
+    brand: Optional[str],
+    ean: Optional[str],
+    currency: Optional[str],
+    attributes: Optional[List[dict]] = None,
+    images: Optional[List[dict]] = None,
+) -> str:
+    h = hashlib.sha256()
+    for field in [title, short_description, description, long_description, brand, ean, currency]:
+        h.update((str(field or "").strip()).encode("utf-8"))
+    h.update(str(price or "").encode("utf-8"))
+    h.update(str(regular_price or "").encode("utf-8"))
+    if attributes:
+        for attr in sorted(
+            attributes,
+            key=lambda a: (a.get("attribute_name") or "", a.get("sort_order") or 0),
+        ):
+            name = str(attr.get("attribute_name") or "").strip()
+            val = str(attr.get("attribute_value") or "").strip()
+            h.update(f"{name}:{val}".encode("utf-8"))
+    if images:
+        for img in sorted(
+            images,
+            key=lambda i: (i.get("sort_order") or 0, i.get("image_url") or ""),
+        ):
+            h.update(str(img.get("image_url") or "").encode("utf-8"))
+    return h.hexdigest()
+
 
 
 async def upsert_product(
@@ -705,49 +782,121 @@ async def upsert_product(
     short_description: Optional[str] = None,
     product_categories_paths: Optional[List[str]] = None,
 ) -> Tuple[Product, bool, Tuple[int, int]]:
-    """Upsert a product by SKU.
+    """Upsert a product primarily by reference store product_id, falling back to SKU.
 
-    Returns ``(product, is_new, (relationships_created, relationships_existing))``.
+    Preserves internal auto-increment ID. Detects SKU collisions.
+    Updates content_updated_at and content_hash only on true content changes.
+    Updates stock_updated_at only on true stock changes.
+    Validates EAN/GTIN check digits without discarding records.
+    Returns (product, is_new, (relationships_created, relationships_existing)).
     """
-    result = await db.execute(select(Product).where(Product.sku == sku))
-    product = result.scalar_one_or_none()
-    is_new = product is None
+    now = utc_now()
+    ean_valid, ean_error = validate_gtin(ean)
+
+    # 1. Primary lookup by immutable product_id
+    product = None
+    if product_id:
+        result = await db.execute(
+            select(Product).where(Product.product_id == str(product_id))
+        )
+        product = result.scalar_one_or_none()
+
+    # 2. Secondary lookup by SKU
+    sku_result = await db.execute(select(Product).where(Product.sku == sku))
+    product_by_sku = sku_result.scalar_one_or_none()
 
     if product:
-        product.product_id = product_id or product.product_id
+        if product_by_sku and product_by_sku.id != product.id:
+            logger.warning(
+                "SKU collision: Product ID %s has SKU '%s' which belongs to distinct Product record #%d (Product ID %s)",
+                product_id, sku, product_by_sku.id, product_by_sku.product_id
+            )
+    else:
+        if product_by_sku:
+            if not product_by_sku.product_id or product_by_sku.product_id == str(product_id):
+                product = product_by_sku
+            else:
+                logger.warning(
+                    "SKU collision on new record: Incoming product_id %s has SKU '%s' already held by Product #%d (ID %s). Updating matching SKU.",
+                    product_id, sku, product_by_sku.id, product_by_sku.product_id
+                )
+                product = product_by_sku
+
+    is_new = product is None
+
+    new_hash = compute_content_hash(
+        title=title,
+        short_description=short_description or description,
+        description=description,
+        long_description=long_description,
+        price=price,
+        regular_price=regular_price if regular_price is not None else price,
+        brand=brand,
+        ean=ean,
+        currency=currency,
+        attributes=attributes,
+        images=images,
+    )
+
+    if product:
+        product.product_id = str(product_id) if product_id else product.product_id
+        product.sku = sku or product.sku
         product.ean = ean or product.ean
-        product.title = title or product.title
-        if description is not None:
-            product.description = description
-        if short_description is not None:
-            product.short_description = short_description
-        if long_description is not None:
-            product.long_description = long_description
-        if regular_price is not None:
-            product.regular_price = regular_price
-        product.price = price if price is not None else product.price
-        if regular_price is None and price is not None:
-            product.regular_price = price
-        if stock is not None:
+        product.ean_valid = ean_valid
+        product.ean_error = ean_error
+
+        content_changed = (product.content_hash != new_hash) or (product.content_hash is None)
+        if content_changed:
+            product.title = title or product.title
+            if description is not None:
+                product.description = description
+            if short_description is not None:
+                product.short_description = short_description
+            if long_description is not None:
+                product.long_description = long_description
+            if regular_price is not None:
+                product.regular_price = regular_price
+            product.price = price if price is not None else product.price
+            if regular_price is None and price is not None:
+                product.regular_price = price
+            product.brand = brand or product.brand
+            product.currency = currency
+            product.url = url or product.url
+            if raw_json is not None:
+                product.raw_json = raw_json
+            product.content_hash = new_hash
+            product.content_updated_at = now
+            product.updated_at = now
+
+        stock_changed = False
+        if stock is not None and product.stock != stock:
             product.stock = stock
-        elif product.stock is None:
+            stock_changed = True
+        elif product.stock is None and stock is not None:
             product.stock = stock
-        if stock_status is not None:
+            stock_changed = True
+
+        if stock_status is not None and product.stock_status != stock_status:
             product.stock_status = stock_status
-        product.brand = brand or product.brand
-        product.currency = currency
-        product.url = url or product.url
+            stock_changed = True
+
+        if stock_changed or product.stock_updated_at is None:
+            product.stock_updated_at = now
+            product.updated_at = now
+
         if category_ids:
             product.category_ids = category_ids
-        if raw_json is not None:
-            product.raw_json = raw_json
+
         product.is_active = True
-        product.updated_at = utc_now()
+        product.missing_streak = 0
+        product.last_seen_at = now
     else:
         product = Product(
-            product_id=product_id,
+            product_id=str(product_id) if product_id else None,
             sku=sku,
             ean=ean,
+            ean_valid=ean_valid,
+            ean_error=ean_error,
             title=title,
             description=description,
             short_description=short_description or description,
@@ -762,6 +911,14 @@ async def upsert_product(
             category_ids=category_ids,
             raw_json=raw_json,
             is_active=True,
+            missing_streak=0,
+            content_hash=new_hash,
+            discovered_at=now,
+            content_updated_at=now,
+            stock_updated_at=now if (stock is not None or stock_status is not None) else None,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
         )
         db.add(product)
 
@@ -1170,3 +1327,69 @@ async def get_stock_update_logs(
     result = await db.execute(stmt)
     logs = list(result.scalars().all())
     return logs, total
+
+
+async def mark_unseen_products_missing(
+    db: AsyncSession,
+    seen_product_ids: Set[str],
+    confirmation_threshold: int = 3,
+) -> int:
+    """Increment missing_streak for SoundImports products absent from a complete, successful discovery scan.
+    Only products whose reference store ID is known and which fail multiple consecutive scans
+    are marked is_active=False. Never delete or deactivate local-only / Car Audio products!
+    """
+    if not seen_product_ids:
+        logger.warning("Empty seen_product_ids set; skipping mark_unseen_products_missing to prevent false removals")
+        return 0
+
+    result = await db.execute(
+        select(Product).where(Product.product_id.isnot(None), Product.product_id != "")
+    )
+    products = list(result.scalars().all())
+    deactivated = 0
+
+    for prod in products:
+        if str(prod.product_id) not in seen_product_ids:
+            prod.missing_streak = (prod.missing_streak or 0) + 1
+            if prod.missing_streak >= confirmation_threshold and prod.is_active:
+                prod.is_active = False
+                deactivated += 1
+                logger.info(
+                    "Product #%d (SKU %s, ref ID %s) deactivated after %d missed scans",
+                    prod.id, prod.sku, prod.product_id, prod.missing_streak
+                )
+        else:
+            prod.missing_streak = 0
+            prod.is_active = True
+            prod.last_seen_at = utc_now()
+
+    await db.commit()
+    return deactivated
+
+
+async def get_delta_products(
+    db: AsyncSession,
+    after_id: Optional[int] = None,
+    since_date: Optional[datetime] = None,
+    limit: int = 50,
+) -> Tuple[List[Product], int]:
+    query = select(Product)
+    count_query = select(func.count(Product.id))
+
+    if since_date:
+        cond = (
+            (Product.content_updated_at >= since_date)
+            | (Product.stock_updated_at >= since_date)
+            | ((Product.content_updated_at.is_(None)) & (Product.updated_at >= since_date))
+        )
+        query = query.where(cond)
+        count_query = count_query.where(cond)
+
+    total = (await db.execute(count_query)).scalar() or 0
+
+    if after_id is not None:
+        query = query.where(Product.id > after_id)
+
+    query = query.order_by(Product.id.asc()).limit(limit)
+    result = await db.execute(query)
+    return list(result.scalars().all()), total

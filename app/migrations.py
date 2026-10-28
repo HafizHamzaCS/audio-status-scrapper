@@ -77,6 +77,10 @@ async def _detect_unversioned_revision() -> Optional[str]:
             and {"category_id", "canonical_path", "status"} <= progress_columns
         )
         if revision_004:
+            if "discovered_at" in product_columns:
+                return "006"
+            if "stock_update_logs" in tables:
+                return "005"
             return "004"
         if "canonical_path" in category_columns or "product_categories" in tables:
             raise RuntimeError(

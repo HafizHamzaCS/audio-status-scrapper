@@ -81,6 +81,12 @@ class ScrapePipeline:
         self._product_locks: Dict[str, asyncio.Lock] = {}
         self._product_cache: Dict[str, int] = {}
         self._seen_product_ids: Set[int] = set()
+
+        self._seen_reference_ids: Set[str] = set()
+
+        self._seen_product_urls: Set[str] = set()
+        self._seen_reference_ids: Set[str] = set()
+        self._seen_product_urls: Set[str] = set()
         self._stats: Dict[str, Any] = {
             "job_id": None,
             "categories_discovered": 0,
@@ -201,8 +207,24 @@ class ScrapePipeline:
                         exc_info=(type(result), result, result.__traceback__),
                     )
 
+            # Reconcile sitemap-only and category-absent products
+            if self.full and not self.category_filter:
+                try:
+                    await self._reconcile_authoritative_catalog(job_id)
+                except Exception as exc:
+                    logger.warning("Sitemap reconciliation warning: %s", exc)
+
             async with async_session_factory() as db:
                 await crud.recompute_category_counts(db, family=True)
+                if self.full and not self.category_filter and self._seen_reference_ids:
+                    deactivated = await crud.mark_unseen_products_missing(
+                        db,
+                        seen_product_ids=self._seen_reference_ids,
+                        confirmation_threshold=settings.category_deactivation_threshold,
+                    )
+                    if deactivated:
+                        logger.info("Marked %d missing SoundImports products deactivated", deactivated)
+
             await self._detect_count_discrepancies(
                 {category["canonical_path"] for category in categories}
             )
@@ -246,6 +268,31 @@ class ScrapePipeline:
             await heartbeat_task
 
         return self._stats
+
+
+    async def _reconcile_authoritative_catalog(self, job_id: int) -> int:
+        """Cross-check against XML sitemap to discover and scrape any un-indexed products."""
+        logger.info("Starting authoritative sitemap reconciliation...")
+        if not hasattr(self.supplier, "discover_all_product_urls"):
+            return 0
+        if not hasattr(self.supplier, "discover_all_product_urls"):
+            return 0
+        sitemap_urls = await self.supplier.discover_all_product_urls()
+        if not sitemap_urls:
+            logger.info("No sitemap URLs discovered; skipping sitemap reconciliation")
+            return 0
+
+        missing_urls = [u for u in sitemap_urls if u not in self._seen_product_urls]
+        logger.info("Authoritative cross-check: %d total sitemap URLs, %d not seen in category crawl", len(sitemap_urls), len(missing_urls))
+
+        if not missing_urls:
+            return 0
+
+        logger.info("Ingesting %d sitemap-only products through standard parser pipeline...", len(missing_urls))
+        missing_items = [{"url": u, "id": "", "code": ""} for u in missing_urls]
+        found, failed, p_ids, errs = await self._process_product_list(missing_items, category_path=None)
+        logger.info("Sitemap-only products ingested: %d succeeded, %d failed", found, failed)
+        return found
 
     async def _heartbeat_job(self, job_id: int, stop: asyncio.Event) -> None:
         """Renew the database lease while a scrape process is alive."""
@@ -764,9 +811,15 @@ class ScrapePipeline:
                                 # components, Coils, Air core coils) and would
                                 # otherwise create relationships to categories
                                 # whose own pages never list the product.
-                                product_categories_paths=[category_path]
-                                if category_path
-                                else [],
+                                product_categories_paths=(
+                                    [category_path]
+                                    if category_path
+                                    else [
+                                        pc["canonical_path"]
+                                        for pc in product_data.get("product_categories", [])
+                                        if pc.get("canonical_path")
+                                    ]
+                                ),
                             )
                             self._stats["relationships_created"] += rel_created
                             self._stats["relationships_existing"] += rel_existing
@@ -775,6 +828,10 @@ class ScrapePipeline:
                     async with lock:
                         found += 1
                         product_ids.add(db_product.id)
+                        if db_product.product_id:
+                            self._seen_reference_ids.add(str(db_product.product_id))
+                        if db_product.url:
+                            self._seen_product_urls.add(db_product.url)
                         if db_product.id not in self._seen_product_ids:
                             self._seen_product_ids.add(db_product.id)
                             self._stats["products_total"] += 1

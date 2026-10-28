@@ -41,6 +41,19 @@ class SoundImportsScraper(BaseSupplierScraper):
     async def discover_categories(self) -> List[Dict[str, Any]]:
         return await self.sitemap_parser.parse()
 
+    async def get_collection_page(
+        self, page: int = 1, limit: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch a page of products from the global collection endpoint."""
+        url = urljoin(settings.base_url, "/en/collection/")
+        if page > 1:
+            url = urljoin(settings.base_url, f"/en/collection/page{page}.html")
+        params = {"format": "json", "limit": limit}
+        return await self._client.fetch_json(url, params=params)
+
+    async def discover_all_product_urls(self) -> List[str]:
+        return await self.sitemap_parser.discover_product_urls()
+
     async def get_product_list(
         self, category_url: str, page: int = 1, limit: int = 100
     ) -> Dict[str, Any]:

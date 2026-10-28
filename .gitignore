@@ -19,3 +19,17 @@ htmlcov/
 *.sqlite3
 .DS_Store
 Thumbs.db
+
+# Git repository metadata
+/COMMIT_EDITMSG
+/FETCH_HEAD
+/HEAD
+/config
+/description
+/hooks/
+/index
+/info/
+/logs/
+/objects/
+/packed-refs
+/refs/

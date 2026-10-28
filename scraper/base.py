@@ -74,3 +74,6 @@ class BaseSupplierScraper(ABC):
     def concurrency(self) -> int:
         """Recommended concurrency for this supplier."""
         ...
+
+    async def discover_all_product_urls(self) -> List[str]:
+        return []
