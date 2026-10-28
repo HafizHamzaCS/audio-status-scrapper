@@ -381,7 +381,7 @@ async def get_product_by_sku(
 
     if not product or (sku == "NE85W-04" and not any(c.canonical_path == "/en/peerless-by-tymphany-woofers/" for c in product.categories)):
         try:
-            from scripts.import_missing_reference_products import MISSING_PRODUCTS_DATA
+            from app.reference_products import MISSING_PRODUCTS_DATA
             from scraper.soundimports import SoundImportsScraper
 
             target = next(
@@ -614,7 +614,7 @@ async def sync_missing_products_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        from scripts.import_missing_reference_products import import_missing_products
+        from app.reference_products import import_missing_products
         now = utc_now()
         job = ScrapeJob(
             job_type="missing_products_sync",
