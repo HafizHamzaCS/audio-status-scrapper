@@ -656,8 +656,7 @@ async def sync_missing_products_endpoint(
         )
     except Exception as exc:
         logger.exception("sync_missing_products error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))",
-    )
+        raise HTTPException(status_code=500, detail=str(exc))
 
 @router.post("/sync", response_model=SyncResponse)
 async def trigger_sync(
