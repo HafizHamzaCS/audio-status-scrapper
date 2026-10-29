@@ -233,7 +233,7 @@ async def test_safe_deactivation_protects_local_products(session_factory):
 
         # Run mark_unseen_products_missing with a set that does NOT contain "999999"
         deactivated = await crud.mark_unseen_products_missing(
-            db, seen_product_ids={"other_id"}, confirmation_threshold=2
+            db, seen_product_ids={"other_id"}, confirmation_threshold=2, min_catalog_threshold=1
         )
         assert deactivated == 0  # streak is 1, not yet deactivated
 
@@ -246,7 +246,7 @@ async def test_safe_deactivation_protects_local_products(session_factory):
 
         # Second missed scan: passes threshold=2
         deactivated2 = await crud.mark_unseen_products_missing(
-            db, seen_product_ids={"other_id"}, confirmation_threshold=2
+            db, seen_product_ids={"other_id"}, confirmation_threshold=2, min_catalog_threshold=1
         )
         assert deactivated2 == 1
 
@@ -350,3 +350,203 @@ async def test_import_missing_reference_products_and_ne85w04(session_factory, mo
         detail = ProductDetail.model_validate(ne_prod)
         assert any("peerless" in c.lower() for c in detail.categories)
         assert any("peerless" in s.lower() for s in detail.category_slugs)
+
+
+@pytest.mark.asyncio
+async def test_category_paths_isolation_and_deduplication(session_factory):
+    """Test requirement 1: Category hierarchy output must expose independent, ordered
+    paths, deduplicate equivalent labels, and ensure promotional categories cannot
+    become children of technical leaf categories."""
+    from app.schemas import ProductDetail
+
+    async with session_factory() as db:
+        # Create categories for technical hierarchy
+        c1 = Category(name="Audio components", slug="audio-components", canonical_path="/en/audio-components/", url="https://www.soundimports.eu/en/audio-components/", is_active=True)
+        c2 = Category(name="Woofers", slug="woofers", canonical_path="/en/audio-components/woofers/", url="https://www.soundimports.eu/en/audio-components/woofers/", is_active=True)
+        c3 = Category(name="Full-range woofer", slug="full-range-woofer", canonical_path="/en/audio-components/woofers/full-range-woofer/", url="https://www.soundimports.eu/en/audio-components/woofers/full-range-woofer/", is_active=True)
+        # Promotional brand category
+        c_brand = Category(name="Peerless by Tymphany woofers", slug="peerless-by-tymphany-woofers", canonical_path="/en/peerless-by-tymphany-woofers/", url="https://www.soundimports.eu/en/peerless-by-tymphany-woofers/", is_active=True)
+        db.add_all([c1, c2, c3, c_brand])
+        await db.commit()
+
+        # Insert NE85W-04 with all 4 categories linked
+        prod, _, _ = await crud.upsert_product(
+            db,
+            product_id="65895191",
+            sku="NE85W-04",
+            ean=None,
+            title='NE85W-04 2.5" Full Range Woofer',
+            description="High quality woofer",
+            long_description="High quality woofer details",
+            price=39.95,
+            stock=15,
+            stock_status="in_stock",
+            brand="Peerless by Tymphany",
+            currency="EUR",
+            url="https://www.soundimports.eu/en/peerless-by-tymphany-ne85w-04.html",
+            category_ids="",
+            raw_json=None,
+            images=[],
+            attributes=[],
+            product_categories_paths=[
+                "/en/audio-components/",
+                "/en/audio-components/woofers/",
+                "/en/audio-components/woofers/full-range-woofer/",
+                "/en/peerless-by-tymphany-woofers/",
+            ],
+        )
+        await db.commit()
+
+        # Reload with categories relationship
+        loaded = await crud.get_product_by_sku(db, "NE85W-04")
+        assert loaded is not None
+        detail = ProductDetail.model_validate(loaded)
+
+        # 1. Verify independent ordered category_paths
+        assert hasattr(detail, "category_paths")
+        assert len(detail.category_paths) == 2, f"Expected 2 independent paths, got: {detail.category_paths}"
+
+        # First path must be the technical hierarchy
+        assert detail.category_paths[0] == ["Audio components", "Woofers", "Full-range woofer"]
+        # Second path must be the promotional/brand hierarchy
+        assert detail.category_paths[1] == ["Peerless by Tymphany woofers"]
+
+        # 2. Promotional category must NOT be a child of technical leaf
+        for path in detail.category_paths:
+            if "Full-range woofer" in path:
+                assert "Peerless by Tymphany woofers" not in path
+
+        # 3. Flat categories list must deduplicate labels
+        assert len(detail.categories) == len(set(c.lower() for c in detail.categories))
+        assert "Audio components" in detail.categories
+        assert "Peerless by Tymphany woofers" in detail.categories
+
+
+@pytest.mark.asyncio
+async def test_saved_catalog_safe_ingestion(session_factory, monkeypatch):
+    """Test requirement 4: Loading packaged reference catalog at startup cannot overwrite
+    newer prices, stock, descriptions, or timestamps on existing products."""
+    monkeypatch.setattr("app.reference_products.async_session_factory", session_factory)
+    from app.reference_products import import_missing_products
+
+    # Pre-seed existing product with a live, updated price and stock
+    async with session_factory() as db:
+        prod, _, _ = await crud.upsert_product(
+            db,
+            product_id="164647193",
+            sku="XBS25-4-bundle",
+            ean="8719324021234",
+            title="Live Updated Title",
+            description="Live Updated Description",
+            long_description="Live Updated Long Desc",
+            price=129.99,
+            regular_price=139.99,
+            stock=42,
+            stock_status="in_stock",
+            brand="Xcite",
+            currency="EUR",
+            url="https://www.soundimports.eu/en/xcite-xbs25-4-bundle.html",
+            category_ids="",
+            raw_json=None,
+            images=[],
+            attributes=[],
+        )
+        await db.commit()
+        original_price = prod.price
+        original_stock = prod.stock
+        original_title = prod.title
+        original_content_updated_at = prod.content_updated_at
+
+    # Execute reference catalog import
+    summary = await import_missing_products()
+    assert summary["succeeded"] >= 1
+
+    # Verify that existing product data was NOT overwritten
+    async with session_factory() as db:
+        rechecked = await crud.get_product_by_sku(db, "XBS25-4-bundle")
+        assert rechecked is not None
+        assert rechecked.price == original_price == 129.99
+        assert rechecked.stock == original_stock == 42
+        assert rechecked.title == original_title == "Live Updated Title"
+        assert rechecked.content_updated_at == original_content_updated_at
+
+
+@pytest.mark.asyncio
+async def test_partial_discovery_streak_guard(session_factory):
+    """Test requirement 2: Incomplete discovery runs (< min_catalog_threshold)
+    must never increment missing streaks or deactivate products."""
+    async with session_factory() as db:
+        # Insert 5 active products
+        for i in range(1, 6):
+            await crud.upsert_product(
+                db,
+                product_id=f"DISC-{i}",
+                sku=f"SKU-DISC-{i}",
+                ean=None,
+                title=f"Discovery Product {i}",
+                description="",
+                long_description="",
+                price=10.0,
+                stock=5,
+                stock_status="in_stock",
+                brand="Brand",
+                currency="EUR",
+                url=f"https://example.com/{i}",
+                category_ids="",
+                raw_json=None,
+                images=[],
+                attributes=[],
+            )
+        await db.commit()
+
+        # Partial crawl only saw product "DISC-1" out of 5, threshold is 5 (or default 7500)
+        seen_partial = {"DISC-1"}
+        deactivated = await crud.mark_unseen_products_missing(
+            db,
+            seen_product_ids=seen_partial,
+            confirmation_threshold=3,
+            min_catalog_threshold=5,
+        )
+        assert deactivated == 0
+
+        # Check that DISC-2..5 streaks were NOT incremented
+        p2 = await crud.get_product_by_sku(db, "SKU-DISC-2")
+        assert p2.missing_streak == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_false_missing_streaks(session_factory):
+    """Test requirement 2: Safely repair false missing streaks on active products."""
+    async with session_factory() as db:
+        # Pre-seed active products with falsely incremented missing streaks
+        for i in range(1, 4):
+            p, _, _ = await crud.upsert_product(
+                db,
+                product_id=f"REPAIR-{i}",
+                sku=f"SKU-REPAIR-{i}",
+                ean=None,
+                title=f"Repair Product {i}",
+                description="",
+                long_description="",
+                price=10.0,
+                stock=5,
+                stock_status="in_stock",
+                brand="Brand",
+                currency="EUR",
+                url=f"https://example.com/repair-{i}",
+                category_ids="",
+                raw_json=None,
+                images=[],
+                attributes=[],
+            )
+            p.missing_streak = 2  # Falsely incremented
+        await db.commit()
+
+        repaired_count = await crud.repair_false_missing_streaks(db)
+        assert repaired_count >= 3
+
+        # Verify all are now 0
+        for i in range(1, 4):
+            p = await crud.get_product_by_sku(db, f"SKU-REPAIR-{i}")
+            assert p.missing_streak == 0
+            assert p.is_active is True

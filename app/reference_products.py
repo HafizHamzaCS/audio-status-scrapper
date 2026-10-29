@@ -107,6 +107,34 @@ async def import_missing_products(target_skus: Optional[List[str]] = None) -> Di
                 expected_sku = item.get("sku") or sku_key
                 cat_paths = item.get("product_categories_paths", [])
 
+                # Check if product already exists in database
+                existing = None
+                if ref_id:
+                    res = await db.execute(select(Product).where(Product.product_id == ref_id))
+                    existing = res.scalar_one_or_none()
+                if not existing and expected_sku:
+                    existing = await crud.get_product_by_sku(db, expected_sku)
+
+                if existing:
+                    # SAFEGUARD: The product already exists in the live database!
+                    # DO NOT overwrite newer live prices, stock, descriptions, or timestamps!
+                    # Only ensure category associations and active status:
+                    if cat_paths:
+                        await crud.set_product_categories(db, existing.id, cat_paths)
+                    if not existing.is_active:
+                        existing.is_active = True
+                    await db.commit()
+                    succeeded += 1
+                    results.append({
+                        "sku": existing.sku,
+                        "db_id": existing.id,
+                        "product_id": existing.product_id,
+                        "title": existing.title,
+                        "status": "preserved_existing",
+                    })
+                    continue
+
+                # Product is missing from database: insert fresh record
                 db_prod, is_new, _ = await crud.upsert_product(
                     db,
                     product_id=ref_id,

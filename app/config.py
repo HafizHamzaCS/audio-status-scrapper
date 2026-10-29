@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     category_deactivation_threshold: int = 2
     job_stale_after: int = 120
     auto_stock_sync_hours: int = 6
+    min_discovery_catalog_threshold: int = 7500
 
     @field_validator(
         "concurrency",
@@ -123,6 +124,7 @@ class Settings(BaseSettings):
                 "SCRAPER_CATEGORY_DEACTIVATION_THRESHOLD"
             ),
             "job_stale_after": int_pick("SCRAPER_JOB_STALE_AFTER"),
+            "min_discovery_catalog_threshold": int_pick("SCRAPER_MIN_DISCOVERY_THRESHOLD", "MIN_DISCOVERY_THRESHOLD"),
         }
         for key, value in overrides.items():
             if value is not None:

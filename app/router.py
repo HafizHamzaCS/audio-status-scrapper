@@ -609,6 +609,7 @@ async def telemetry(limit: int = Query(60, le=500)):
 @router.get("/products/delta", response_model=ProductDeltaResponse, summary="Stable cursor-based delta feed of changed products")
 async def get_products_delta(
     cursor: Optional[str] = Query(None, description="Opaque cursor for delta stream"),
+    after_id: Optional[int] = Query(None, description="Direct integer ID cursor for keyset pagination"),
     since: Optional[str] = Query(None, description="ISO timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
     limit: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -623,14 +624,14 @@ async def get_products_delta(
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format or YYYY-MM-DD.")
 
-    after_id = None
-    if cursor:
+    resolved_after_id = after_id
+    if resolved_after_id is None and cursor:
         try:
-            after_id = int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+            resolved_after_id = int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    products, total = await crud.get_delta_products(db, after_id=after_id, since_date=since_date, limit=limit)
+    products, total = await crud.get_delta_products(db, after_id=resolved_after_id, since_date=since_date, limit=limit)
     has_more = len(products) == limit
     next_cursor = (
         base64.urlsafe_b64encode(str(products[-1].id).encode("utf-8")).decode("ascii")
@@ -651,6 +652,9 @@ async def get_products_delta(
             content_updated_at=p.content_updated_at.isoformat() if p.content_updated_at else (p.updated_at.isoformat() if p.updated_at else None),
             stock_updated_at=p.stock_updated_at.isoformat() if p.stock_updated_at else None,
             last_seen_at=p.last_seen_at.isoformat() if p.last_seen_at else None,
+            content_hash=getattr(p, "content_hash", None),
+            ean_valid=getattr(p, "ean_valid", None),
+            missing_streak=getattr(p, "missing_streak", 0) or 0,
         )
         for p in products
     ]

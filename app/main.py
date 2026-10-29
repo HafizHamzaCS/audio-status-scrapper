@@ -68,6 +68,13 @@ async def lifespan(app: FastAPI):
                 logger.info("Canonical reference catalog verified and synced on startup.")
             except Exception as ref_err:
                 logger.warning("Reference products sync warning on startup: %s", ref_err)
+            try:
+                async with async_session_factory() as session:
+                    repaired_streaks = await crud.repair_false_missing_streaks(session)
+                    if repaired_streaks:
+                        logger.info("Repaired %d false missing streaks on startup.", repaired_streaks)
+            except Exception as streak_err:
+                logger.warning("Could not repair false missing streaks on startup: %s", streak_err)
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc

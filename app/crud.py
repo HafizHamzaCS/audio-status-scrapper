@@ -1393,6 +1393,7 @@ async def mark_unseen_products_missing(
     db: AsyncSession,
     seen_product_ids: Set[str],
     confirmation_threshold: int = 3,
+    min_catalog_threshold: Optional[int] = None,
 ) -> int:
     """Increment missing_streak for SoundImports products absent from a complete, successful discovery scan.
     Only products whose reference store ID is known and which fail multiple consecutive scans
@@ -1400,6 +1401,16 @@ async def mark_unseen_products_missing(
     """
     if not seen_product_ids:
         logger.warning("Empty seen_product_ids set; skipping mark_unseen_products_missing to prevent false removals")
+        return 0
+
+    from app.config import settings
+    min_threshold = min_catalog_threshold if min_catalog_threshold is not None else getattr(settings, "min_discovery_catalog_threshold", 7500)
+    if len(seen_product_ids) < min_threshold:
+        logger.warning(
+            "Discovery run only observed %d products (< %d minimum sanity threshold). "
+            "Aborting missing_streak increment to protect catalog integrity from partial/interrupted scans.",
+            len(seen_product_ids), min_threshold,
+        )
         return 0
 
     result = await db.execute(
@@ -1425,6 +1436,29 @@ async def mark_unseen_products_missing(
 
     await db.commit()
     return deactivated
+
+
+async def repair_false_missing_streaks(db: AsyncSession) -> int:
+    """Safely reset missing_streak to 0 for active SoundImports products whose streak
+    was erroneously incremented by previous partial or interrupted discovery runs.
+    Does NOT delete or deactivate any products.
+    """
+    result = await db.execute(
+        select(Product).where(
+            Product.missing_streak > 0,
+            Product.is_active == True,
+            Product.product_id.isnot(None),
+            Product.product_id != "",
+        )
+    )
+    products = list(result.scalars().all())
+    count = len(products)
+    if count > 0:
+        for p in products:
+            p.missing_streak = 0
+        await db.commit()
+        logger.info("Repaired %d active products with false missing_streak back to 0", count)
+    return count
 
 
 async def get_delta_products(

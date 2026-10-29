@@ -217,13 +217,20 @@ class ScrapePipeline:
             async with async_session_factory() as db:
                 await crud.recompute_category_counts(db, family=True)
                 if self.full and not self.category_filter and self._seen_reference_ids:
-                    deactivated = await crud.mark_unseen_products_missing(
-                        db,
-                        seen_product_ids=self._seen_reference_ids,
-                        confirmation_threshold=settings.category_deactivation_threshold,
-                    )
-                    if deactivated:
-                        logger.info("Marked %d missing SoundImports products deactivated", deactivated)
+                    cat_failed = self._stats.get("categories_failed", 0)
+                    if cat_failed > 0:
+                        logger.warning(
+                            "Discovery sweep had %d failed categories; aborting missing_streak increment to protect catalog.",
+                            cat_failed,
+                        )
+                    else:
+                        deactivated = await crud.mark_unseen_products_missing(
+                            db,
+                            seen_product_ids=self._seen_reference_ids,
+                            confirmation_threshold=settings.category_deactivation_threshold,
+                        )
+                        if deactivated:
+                            logger.info("Marked %d missing SoundImports products deactivated", deactivated)
 
             await self._detect_count_discrepancies(
                 {category["canonical_path"] for category in categories}

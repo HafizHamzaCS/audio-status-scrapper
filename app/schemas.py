@@ -141,11 +141,16 @@ def _resolve_category_path(cats: List[str]) -> List[str]:
 
 
 def _category_path_from_orm(product: Product):
-    """Derive the primary category and full path from the relational
-    ``product.categories`` association (preferred over legacy slug string).
+    """Derive the primary category and independent, ordered category paths from
+    the relational ``product.categories`` association.
 
-    Returns ``(category, categories, category_slugs)`` with the canonical
-    root-to-leaf order, choosing the deepest category path as primary.
+    Returns ``(primary, categories, category_slugs, category_paths)`` where:
+    - ``category_paths`` is a list of independent, ordered category label lists
+      representing distinct root-to-leaf hierarchies (e.g. technical hierarchy
+      and promotional brand hierarchy).
+    - ``primary`` is the leaf category of the main technical hierarchy.
+    - ``categories`` is a backward-compatible deduplicated list of unique names.
+    - ``category_slugs`` is a deduplicated list of unique category slugs.
     """
     cats = list(getattr(product, "categories", None) or [])
     if not cats:
@@ -159,38 +164,85 @@ def _category_path_from_orm(product: Product):
             parts = parts[1:]
         return parts
 
-    best = max(cats, key=lambda c: (len(path_slugs(c)), c.slug or ""))
-    best_slugs = path_slugs(best)
-    primary = format_category_name(best_slugs[-1]) if best_slugs else format_category_name(best.slug)
-
-    slugs = list(best_slugs)
-    names = [format_category_name(s) for s in slugs]
-
-    # Include all associated categories (e.g. promotional, brand, secondary)
+    raw_paths = []
     for c in cats:
-        c_slugs = path_slugs(c)
-        for s in c_slugs:
-            if s not in slugs:
-                slugs.append(s)
-                names.append(format_category_name(s))
-        if c.slug and c.slug not in slugs:
-            slugs.append(c.slug)
-        if c.name and c.name not in names:
-            names.append(c.name)
+        ps = path_slugs(c)
+        if not ps and getattr(c, "slug", None):
+            ps = [c.slug]
+        if ps:
+            raw_paths.append(ps)
+
+    if not raw_paths:
+        return None
+
+    # Sort paths by length descending so deepest technical paths appear first
+    raw_paths.sort(key=lambda p: len(p), reverse=True)
+
+    # Filter out sub-paths that are prefixes of longer paths to isolate leaf hierarchies
+    leaf_slug_paths = [
+        p for p in raw_paths
+        if not any(len(p) < len(other) and other[:len(p)] == p for other in raw_paths)
+    ]
+
+    # Deduplicate identical leaf paths while preserving order
+    unique_leaf_slug_paths = []
+    seen_tuples = set()
+    for p in leaf_slug_paths:
+        t = tuple(p)
+        if t not in seen_tuples:
+            seen_tuples.add(t)
+            unique_leaf_slug_paths.append(p)
+
+    # Build slug to authoritative category name dictionary
+    slug_to_name = {
+        c.slug.lower(): c.name
+        for c in cats
+        if getattr(c, "slug", None) and getattr(c, "name", None)
+    }
+
+    category_paths = []
+    for p in unique_leaf_slug_paths:
+        path_names = [slug_to_name.get(s.lower(), format_category_name(s)) for s in p]
+        category_paths.append(path_names)
+
+    primary = category_paths[0][-1] if category_paths and category_paths[0] else "Uncategorized"
+
+    # Case-insensitive deduplication for backward-compatible flat categories list
+    seen_names = set()
+    deduped_categories = []
+    for path in category_paths:
+        for name in path:
+            if name.lower() not in seen_names:
+                seen_names.add(name.lower())
+                deduped_categories.append(name)
+
+    seen_slugs = set()
+    deduped_slugs = []
+    for path in unique_leaf_slug_paths:
+        for s in path:
+            if s.lower() not in seen_slugs:
+                seen_slugs.add(s.lower())
+                deduped_slugs.append(s)
 
     return (
         primary,
-        names,
-        slugs,
+        deduped_categories,
+        deduped_slugs,
+        category_paths,
     )
 
 
 def _legacy_category_info(data):
     cats = data.category_ids.split(",") if data.category_ids else []
+    primary = _resolve_primary_category(cats)
+    categories = _resolve_category_path(cats)
+    category_slugs = cats
+    category_paths = [categories] if categories else []
     return (
-        _resolve_primary_category(cats),
-        _resolve_category_path(cats),
-        cats,
+        primary,
+        categories,
+        category_slugs,
+        category_paths,
     )
 
 
@@ -211,6 +263,7 @@ class ProductListItem(BaseModel):
     category: str = "Uncategorized"
     categories: List[str] = Field(default_factory=list)
     category_slugs: List[str] = Field(default_factory=list)
+    category_paths: List[List[str]] = Field(default_factory=list)
     images: List[ImageOut] = Field(default_factory=list)
     attributes: List[AttributeOut] = Field(default_factory=list)
     specifications: List[SpecificationOut] = Field(default_factory=list)
@@ -222,9 +275,9 @@ class ProductListItem(BaseModel):
         if isinstance(data, Product):
             rel = _category_path_from_orm(data)
             if rel:
-                primary, formatted_path, slugs = rel
+                primary, formatted_path, slugs, cat_paths = rel
             else:
-                primary, formatted_path, slugs = _legacy_category_info(data)
+                primary, formatted_path, slugs, cat_paths = _legacy_category_info(data)
             attrs_rel = getattr(data, "attributes_rel", None) or []
             attrs_sorted = sorted(attrs_rel, key=lambda a: a.sort_order or 0)
             attrs_valid = [
@@ -251,6 +304,7 @@ class ProductListItem(BaseModel):
                 "category": primary,
                 "categories": formatted_path,
                 "category_slugs": slugs,
+                "category_paths": cat_paths,
                 "images": [
                     ImageOut(
                         id=i.id,
@@ -298,6 +352,7 @@ class ProductDetail(BaseModel):
     category: str = "Uncategorized"
     categories: List[str] = Field(default_factory=list)
     category_slugs: List[str] = Field(default_factory=list)
+    category_paths: List[List[str]] = Field(default_factory=list)
     images: List[ImageOut] = Field(default_factory=list)
     attributes: List[AttributeOut] = Field(default_factory=list)
     specifications: List[SpecificationOut] = Field(default_factory=list)
@@ -309,9 +364,9 @@ class ProductDetail(BaseModel):
         if isinstance(data, Product):
             rel = _category_path_from_orm(data)
             if rel:
-                primary, formatted_path, slugs = rel
+                primary, formatted_path, slugs, cat_paths = rel
             else:
-                primary, formatted_path, slugs = _legacy_category_info(data)
+                primary, formatted_path, slugs, cat_paths = _legacy_category_info(data)
             attrs_rel = getattr(data, "attributes_rel", None) or []
             attrs_sorted = sorted(attrs_rel, key=lambda a: a.sort_order or 0)
             attrs_valid = [
@@ -338,6 +393,7 @@ class ProductDetail(BaseModel):
                 "category": primary,
                 "categories": formatted_path,
                 "category_slugs": slugs,
+                "category_paths": cat_paths,
                 "images": [
                     ImageOut(
                         id=i.id,
@@ -438,6 +494,9 @@ class ProductDeltaItem(BaseModel):
     content_updated_at: Optional[str] = None
     stock_updated_at: Optional[str] = None
     last_seen_at: Optional[str] = None
+    content_hash: Optional[str] = None
+    ean_valid: Optional[bool] = None
+    missing_streak: Optional[int] = None
 
 
 class ProductDeltaResponse(BaseModel):
